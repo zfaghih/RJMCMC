@@ -1,0 +1,293 @@
+SUBROUTINE HR_FD_FHT(SMT)
+  USE mar_data
+  USE calc_mod
+
+  INTEGER :: IJK,I,J,NF,IDUMP,L
+  REAL (OP) :: RMIN,SMT,DBUF,RBUF,DDUM,XATM
+  COMPLEX (OP),DIMENSION(:,:),ALLOCATABLE :: AUX,FRESP,PAUX,TAUX
+  COMPLEX (OP),DIMENSION(:),ALLOCATABLE :: DC,FRPASS
+
+  REAL (OP) :: HC(300,2),RMAX,U,SQROOT(2),UMIN,UMAX,LRUMAX,LRUMIN
+  INTEGER :: NC0(2),NC(2),NN,LUMIN,LUMAX,PIVOT
+  LOGICAL :: FOUND_ONE,NEED_STEPOFF,LBUF
+  
+  COMPLEX (OP) :: F1,F2
+  REAL (OP), PARAMETER :: SPD = 20.0_OP
+  REAL (OP) :: ROOTU,ROOTLOG
+  REAL (OP), DIMENSION(:),ALLOCATABLE :: CTHICK2,CCON2,CANIS2
+
+  EXTERNAL TMFNL,PMFNL
+
+! Set filter coefficients for needed Hankel transforms
+! Set 1 is J1 (needed for poloroidal fields)
+! Set 2 is J1 prime (needed for toroidal fields)
+
+  CALL FILTER16(4,NC(1),NC0(1),SQROOT(1),HC(1,1))
+  CALL FILTER16(5,NC(2),NC0(2),SQROOT(2),HC(1,2))
+ 
+  NF=NC_FRT+NT_F-1 !! NC_FRT the number of filter coefficients
+  ROOTU=10.0_OP**(1.0_OP/SPD)
+  ROOTLOG=LOG(10.0_OP)/SPD
+  
+  RMIN=1.0E+10
+  RMAX=0.0
+  FOUND_ONE=.FALSE.
+  NEED_STEPOFF=.FALSE.
+  DO IJK=1,NDAT
+     IF (TYPE(IJK)/='STDB') CYCLE
+     FOUND_ONE=.TRUE.
+     NEED_STEPOFF=NEED_STEPOFF.OR.STEP_OFF(IJK)
+     RMIN=MIN(RMIN,SQRT(X(IJK)**2+Y(IJK)**2))
+     RMAX=MAX(RMAX,SQRT(X(IJK)**2+Y(IJK)**2))
+  END DO
+
+  IF (.NOT.FOUND_ONE) RETURN
+
+  LBUF=.FALSE.
+  IF (NEED_STEPOFF.AND.W_DEPTH==0.0_OP) THEN
+     LBUF=.TRUE.
+     DBUF=W_DEPTH
+     RBUF=W_RES
+     W_DEPTH=RMIN/10.0_OP
+     W_RES=1e08_OP
+  ENDIF
+
+  IF (RMIN.LT.0.0001) THEN
+     RMIN=0.0001
+     WRITE(6,*) "<E> Zero horizontal offset, field calculations singular"
+  ENDIF
+  UMIN=SQROOT(2)**(1-NC0(2))/RMAX
+  UMAX=SQROOT(1)**(NC(1)-NC0(1))/RMIN
+  LUMIN=INT(LOG(UMIN))-1
+  LUMAX=INT(LOG(UMAX))+1
+  LRUMIN=REAL(LUMIN)
+  LRUMAX=REAL(LUMAX)
+  UMIN=EXP(REAL(LUMIN))
+  PIVOT=INT((LRUMAX-LRUMIN)/ROOTLOG+0.9999)
+  LRUMAX=LOG(UMIN*ROOTU**(PIVOT-1))
+  UMAX=EXP(REAL(LRUMAX))
+  ALLOCATE(AUX(PIVOT,6),PAUX(3,PIVOT),TAUX(3,PIVOT),FRESP(NDAT,NF))
+  CDSEA=W_DEPTH
+  FRESP=(0.0_OP,0.0_OP)
+
+  IF (LFD) NF=NT_F
+
+! Constructing new model above and below TX
+  ALLOCATE(CTHICK2(NLAY+2),CCON2(NLAY+3),CANIS2(NLAY+3))
+  IF (TX_Z.LE.0) THEN
+     CTHICK2(1)=W_DEPTH+TX_Z
+     CTHICK2(2)=-TX_Z
+     DO I=1,2
+        CANIS2(I)=1_OP
+        CCON2(I)=1_OP/W_RES
+     END DO
+     DO I=1,NLAY
+        CCON2(I+2)=1.0/RES(I)
+        CANIS2(I+2)=ANIS(I)
+        IF (I/=NLAY) CTHICK2(I+2)=TNESS(I)
+     END DO
+  ELSE
+     DDUM=0_OP
+     I=0
+     DO WHILE (TX_Z>DDUM.AND.I<NLAY-1)
+        I=I+1
+        DDUM=DDUM+TNESS(I)
+     END DO
+     CTHICK2(1)=W_DEPTH
+     CANIS2(1)=1_OP
+     CCON2(1)=1_OP/W_RES
+     IF (I==NLAY-1.AND.DDUM<TX_Z) THEN
+        NLU=1+NLAY
+        NLL=1
+        DDUM=0_OP
+        DO I=1,NLAY
+           CCON2(I+1)=1_OP/RES(I)
+           CANIS2(I+1)=ANIS(I)
+           IF (I/=NLAY) THEN
+              CTHICK2(I+1)=TNESS(I)
+              DDUM=DDUM+TNESS(I)
+           ELSE
+              CTHICK2(I+1)=TX_Z-DDUM
+           ENDIF
+        END DO
+        CCON2(NLAY+2)=1./RES(NLAY)
+        CANIS2(NLAY+2)=ANIS(NLAY)
+     ELSE
+        NLU=I+1
+        NLL=NLAY-I+1
+        CCON2(NLU)=1.0/RES(I)
+        CANIS2(NLU)=ANIS(I)
+        CTHICK2(NLU)=TNESS(I)-DDUM+TX_Z
+        CCON2(NLU+1)=1.0/RES(I)
+        CANIS2(NLU+1)=ANIS(I)
+        CTHICK2(NLU+1)=DDUM-TX_Z
+        DO L=1,I-1
+           CCON2(L+1)=1.0/RES(L)
+           CANIS2(L+1)=ANIS(L)
+           CTHICK2(L+1)=TNESS(L)
+        END DO
+        DO L=I+1,NLAY
+           CCON2(L+2)=1.0/RES(L)
+           CANIS2(L+2)=ANIS(L)
+           IF (L/=NLAY) CTHICK2(L+2)=TNESS(L)
+        END DO
+     ENDIF
+  ENDIF
+  
+  ! Insert layer boundary for RX
+  CZ=Z(1)+TX_Z
+  
+  IDUMP=0
+  XATM=-W_DEPTH
+  ALLOCATE(CTHICK(NLAY+2),CCON(NLAY+3),CANIS(NLAY+3))
+  DO L=1,NLAY+1
+     IF (IDUMP.EQ.0.AND.XATM.LT.CZ.AND.XATM+CTHICK2(L).GE.CZ) THEN
+        IDUMP=1
+        CCON(L)=CCON2(L)
+        CCON(L+1)=CCON2(L)
+        CANIS(L)=CANIS2(L)
+        CANIS(L+1)=CANIS2(L)
+        CTHICK(L)=CZ-XATM
+        CTHICK(L+1)=CTHICK2(L)-CZ+XATM
+     ELSE
+        CTHICK(L+IDUMP)=CTHICK2(L)
+        CCON(L+IDUMP)=CCON2(L)
+        CANIS(L+IDUMP)=CANIS2(L)
+     END IF
+     XATM=XATM+CTHICK2(L)
+  END DO
+  IF (IDUMP.EQ.0) THEN
+     CTHICK(NLAY+2)=CZ-XATM
+     CCON(NLAY+2)=CCON2(NLAY+2)
+     CANIS(NLAY+2)=CANIS2(NLAY+2)
+  END IF
+  CCON(NLAY+3)=CCON2(NLAY+2)
+  CANIS(NLAY+3)=CANIS2(NLAY+2)
+  
+  CZ=Z(1)
+
+  CCON2=CCON
+  CTHICK2=CTHICK
+  CANIS2=CANIS
+  DEALLOCATE(CCON,CTHICK,CANIS)
+
+  ! Check for and kick out zero thickness layers
+  IDUMP=0
+  DO I=1,NLAY+2
+     IF (CTHICK2(I).LT.ETA) IDUMP=IDUMP+1
+  ENDDO
+  CNL=NLAY+3-IDUMP
+  ALLOCATE(CTHICK(CNL-1),CCON(CNL),CANIS(CNL))
+  
+  IDUMP=0
+  DO L=1,NLAY+3
+     IF (L.LT.NLAY+3) THEN
+        IF (CTHICK2(L).LT.ETA) THEN
+           IDUMP=IDUMP+1
+        ELSE
+           CCON(L-IDUMP)=CCON2(L)
+           CANIS(L-IDUMP)=CANIS2(L)
+           CTHICK(L-IDUMP)=CTHICK2(L)
+        END IF
+     ELSE
+        CCON(L-IDUMP)=CCON2(L)
+        CANIS(L-IDUMP)=CANIS2(L)          
+     END IF
+  END DO
+  DEALLOCATE(CTHICK2,CCON2,CANIS2)
+  XATM=-W_DEPTH
+  NLU=0
+  NLRX=1
+  DO L=1,CNL-1
+     IF (CZ>XATM+ETA) NLRX=NLRX+1
+     IF (TX_Z>XATM+ETA) NLU=NLU+1
+     XATM=XATM+CTHICK(L)
+  END DO
+  NLL=CNL-NLU
+          
+  DO I=0,NF
+     IF (I==0) THEN
+        IF (.NOT.NEED_STEPOFF) THEN
+           CYCLE
+        ELSE
+           OMEGA=0.0_OP
+           ALLOCATE(DC(IJK))
+           DC=(0.0_OP,0.0_OP)
+        ENDIF
+     ELSE
+        IF (LFD) THEN
+           OMEGA=FTIME(I)*2.0_OP*PI
+        ELSE
+           IDUMP=-NC_FRT+NC0_FRT+I
+           OMEGA=(SQRT10**(1-IDUMP))*QSHIFT/SMT
+        ENDIF
+     ENDIF
+     COMP=2
+     DO J=1,PIVOT
+        U=UMIN*ROOTU**(J-1)
+        CALL PMFNL(U,F1)
+        CALL TMFNL(U,F2)
+        AUX(J,1)=-F1*U
+        AUX(J,2)=-F2
+     END DO
+     CALL SPLIN1N (PIVOT,AUX(1,1),PAUX)                   
+     CALL SPLIN1N (PIVOT,AUX(1,2),TAUX)                    
+
+     DO IJK=1,NDAT
+        IF (TYPE(IJK)/='STDB') CYCLE
+        RMIN=MIN(10000.0,SQRT(X(IJK)*X(IJK)+Y(IJK)*Y(IJK)))
+        CRHO=SQRT(X(IJK)*X(IJK)+Y(IJK)*Y(IJK))
+        F1=CMPLX(0.0_OP,0.0_OP)
+        DO NN=1,NC(1)
+           U=LOG(SQROOT(1)**(NN-NC0(1))/CRHO)
+           CALL SPLIN2N(PIVOT,U,LRUMIN,LRUMAX,TAUX,F2)
+           F1=F1+F2*HC(NN,1)/CRHO
+        END DO      
+        DO NN=1,NC(2)
+           U=LOG(SQROOT(2)**(NN-NC0(2))/CRHO)
+           CALL SPLIN2N(PIVOT,U,LRUMIN,LRUMAX,PAUX,F2)
+           F1=F1+F2*HC(NN,2)
+        END DO
+        IF (I==0) THEN
+           DC(IJK)=F1/CRHO*DL
+        ELSE
+           FRESP(IJK,I)=F1/CRHO*DL
+        ENDIF
+        IF (I>0.AND..NOT.LFD) THEN
+           IF (STEP_OFF(IJK)) THEN
+              FRESP(IJK,I)=DC(IJK)-FRESP(IJK,I)
+           ENDIF
+           IF (.NOT.SYS_RESP(IJK)) &
+                FRESP(IJK,I)=FRESP(IJK,I)/CMPLX(0.0,OMEGA)
+           IF (IMP(IJK)) &
+                FRESP(IJK,I)=FRESP(IJK,I)*CMPLX(0.0,OMEGA)
+           IF (DERIVATE(IJK)) &
+                FRESP(IJK,I)=FRESP(IJK,I)*CMPLX(0.0,OMEGA)
+        ENDIF
+        IF (LFD) THEN
+           EOUT(IJK,I)=REAL(FRESP(IJK,I))
+           EOUT(IJK,I+NT_F)=AIMAG(FRESP(IJK,I))
+        ENDIF           
+     END DO
+  END DO
+  IF (ALLOCATED(DC)) DEALLOCATE(DC)
+  DEALLOCATE(AUX,PAUX,TAUX)
+
+  IF (.NOT.LFD) THEN
+     ALLOCATE(FRPASS(NF))
+     DO IJK=1,NDAT
+        IF (TYPE(IJK)/='STDB') CYCLE     
+        FRPASS=FRESP(IJK,:)
+        CALL FRTSIN10(FRPASS,NF,IJK)
+     END DO
+     DEALLOCATE(FRPASS)
+  ENDIF
+
+  DEALLOCATE(FRESP,CTHICK,CCON,CANIS)
+  IF (LBUF) THEN
+     W_DEPTH=DBUF
+     W_RES=RBUF
+  ENDIF
+
+END SUBROUTINE HR_FD_FHT
+
